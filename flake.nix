@@ -9,7 +9,13 @@
     };
   };
 
-  outputs = { self, nixpkgs, rust-overlay, ... }:
+  outputs =
+    {
+      self,
+      nixpkgs,
+      rust-overlay,
+      ...
+    }:
     let
       systems = [
         "x86_64-linux"
@@ -27,61 +33,83 @@
       # When building from a release commit the Cargo.toml already carries the
       # real version (e.g. "0.101.0").  On the main branch it is the placeholder
       # "0.0.0", so we fall back to a dev version derived from the flake source.
-      version =
-        if cargoVersion != "0.0.0"
-        then cargoVersion
-        else "0.0.0-dev+${self.shortRev or "dirty"}";
-    in
-    {
-      packages = forAllSystems (system:
+      version = if cargoVersion != "0.0.0" then cargoVersion else "0.0.0-dev+${self.shortRev or "dirty"}";
+
+      systemConfig = forAllSystems (
+        system:
         let
           pkgs = import nixpkgs {
             inherit system;
             overlays = [ rust-overlay.overlays.default ];
           };
-          codex-rs = pkgs.callPackage ./codex-rs {
-            inherit version;
-            rustPlatform = pkgs.makeRustPlatform {
-              cargo = pkgs.rust-bin.stable.latest.minimal;
-              rustc = pkgs.rust-bin.stable.latest.minimal;
-            };
+          rustToolchains = import ./nix/rust-toolchain.nix {
+            inherit (pkgs) lib;
+            inherit pkgs;
+            rustToolchainFile = ./codex-rs/rust-toolchain.toml;
+          };
+          repoTools = pkgs.callPackage ./nix/repo-tools.nix { };
+          rustyV8Archive = pkgs.callPackage ./nix/rusty-v8.nix { };
+          codexPackage = pkgs.callPackage ./codex-rs {
+            inherit rustyV8Archive version;
+            rustPlatform = rustToolchains.rustPlatform;
+          };
+          devShell = pkgs.callPackage ./nix/dev-shell.nix {
+            inherit codexPackage repoTools rustyV8Archive;
+            rustToolchain = rustToolchains.development;
           };
         in
         {
-          codex-rs = codex-rs;
-          default = codex-rs;
+          inherit
+            codexPackage
+            devShell
+            pkgs
+            repoTools
+            rustToolchains
+            rustyV8Archive
+            ;
+        }
+      );
+    in
+    {
+      packages = forAllSystems (
+        system:
+        let
+          inherit (systemConfig.${system}) codexPackage repoTools rustyV8Archive;
+        in
+        {
+          bazel = repoTools.bazel;
+          buildifier = repoTools.buildifier;
+          codex-rs = codexPackage;
+          default = codexPackage;
+          rusty-v8-archive = rustyV8Archive;
         }
       );
 
-      devShells = forAllSystems (system:
+      devShells = forAllSystems (system: {
+        default = systemConfig.${system}.devShell;
+      });
+
+      apps = forAllSystems (
+        system:
         let
-          pkgs = import nixpkgs {
-            inherit system;
-            overlays = [ rust-overlay.overlays.default ];
-          };
-          rust = pkgs.rust-bin.stable.latest.default.override {
-            extensions = [ "rust-src" "rust-analyzer" ];
+          codexPackage = systemConfig.${system}.codexPackage;
+          app = {
+            type = "app";
+            program = "${codexPackage}/bin/codex";
+            meta.description = "OpenAI Codex CLI";
           };
         in
         {
-          default = pkgs.mkShell {
-            buildInputs = [
-              rust
-              pkgs.pkg-config
-              pkgs.openssl
-              pkgs.cmake
-              pkgs.llvmPackages.clang
-              pkgs.llvmPackages.libclang.lib
-            ];
-            PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig";
-            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-            # Use clang for BoringSSL compilation (avoids GCC 15 warnings-as-errors)
-            shellHook = ''
-              export CC=clang
-              export CXX=clang++
-            '';
-          };
+          codex = app;
+          default = app;
         }
       );
+
+      checks = forAllSystems (system: {
+        codex-rs = systemConfig.${system}.codexPackage;
+        dev-shell = systemConfig.${system}.devShell;
+      });
+
+      formatter = forAllSystems (system: systemConfig.${system}.pkgs.nixfmt);
     };
 }
